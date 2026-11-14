@@ -465,6 +465,12 @@ mha.heads[0].W_q      # Linear(in_features=64, out_features=8, bias=True)
 - ❌ `Z @ self.W_o`: `W_o` is an `nn.Linear` **module**, not a matrix, so `@` fails. Call it instead: `self.W_o(Z)`.
   - Internally, `nn.Linear` stores `.weight` with shape `(out, in)` and computes `Z @ weight.T + bias`. This is also why you never do the `@` yourself with a Linear layer.
 
+### Mistake in My Third Draft of MHA
+
+- ❌ `def forward(self, X, mask: None)`: `mask: None` is only a **type hint**. It gives `mask` no default, so `mask` is still *required*, and `mha(X)` raises "missing 1 required positional argument: 'mask'".
+  - Fix: `mask: Optional[torch.Tensor] = None`
+  - Rule: `name: Type` is the annotation, and `= value` is the default. They are independent; `mask=None` alone also works.
+
 ---
 
 ### Decision: Stay 2D (No Batch Dimension) for Now
@@ -571,6 +577,8 @@ scores = Q @ K.T / sqrt(d_k)
 **Implementation note:** pairs can be *interleaved* `(0,1), (2,3), …` (the original paper) or *split in halves* `(i, i + d/2)` (the Hugging Face Llama `rotate_half`). Both work as long as you're consistent, but you can't load pretrained weights that use the other layout.
 
 **Test:** `rope(q)` at position m dotted with `rope(k)` at position n should equal the same at positions m+5 and n+5. Also, `‖rope(q)‖ == ‖q‖`.
+
+**Open design question (to answer before coding):** all heads share the same d_k, so their cos/sin tables would be identical. Should each head own a RoPE module, or should one be built in `ManualMultiHeadAttention` and passed to the heads? What are the trade-offs?
 
 ---
 
