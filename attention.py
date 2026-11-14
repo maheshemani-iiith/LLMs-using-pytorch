@@ -42,7 +42,7 @@ class ManualScaledDotProductAttention(nn.Module):
         b) what information does this matrix capture?
     5) The above probability matrix is multiplied by V resulting in a transformed V
     """
-    def __init__(self, X: torch.Tensor, d_k : int, d_v : int, d_m :int):
+    def __init__(self, d_k : int, d_v : int, d_m :int):
         super().__init__()
         """ n is the total # of tokens
              inputs: X:nxd_m, W_k,W_q,W_v
@@ -93,72 +93,32 @@ class ManualMultiHeadAttention(nn.Module):
     - Another might track semantic relationships
     - Another might track long-range dependencies
     """
-
-    def __init__(self, d_model: int = 512, num_heads: int = 8, dropout: float = 0.1):
+    """
+    1) We have h heads, each head can create its own Q,K,V matrices
+        a) We initialize self attention h times and each head has its own set
+        of weight matrices W_q, W_k, W_v
+        b) Do we need to initialize with different seeds?
+        c) how do i loop over h and save only the Z values from ManualScaledDotProductAttention?
+        d) how do i pass the function name as param?
+    2) Each head produces an output Z_i, which is concatenated to form Z 
+        a) is there an equivalent of cbind?
+    3) We need to have all the params we use in ManualScaledDotProductAttention as inputs
+    """
+    def __init__(self, d_k : int, d_v : int, d_m :int, h: int):
         super().__init__()
-        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
-
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.d_k = d_model // num_heads  # Dimension per head
-
-        # Linear projections for Q, K, V
-        self.W_q = nn.Linear(d_model, d_model)
-        self.W_k = nn.Linear(d_model, d_model)
-        self.W_v = nn.Linear(d_model, d_model)
-
-        # Output projection
-        self.W_o = nn.Linear(d_model, d_model)
-
-        # Scaled dot-product attention
-        self.attention = ManualScaledDotProductAttention(self.d_k, dropout)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(
-        self,
-        query: torch.Tensor,      # (batch, seq_len, d_model)
-        key: torch.Tensor,        # (batch, seq_len, d_model)
-        value: torch.Tensor,      # (batch, seq_len, d_model)
-        mask: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            query, key, value: (batch, seq_len, d_model)
-            mask: Optional attention mask
-
-        Returns:
-            output: (batch, seq_len, d_model)
-            attention_weights: (batch, num_heads, seq_len, seq_len)
-        """
-        batch_size = query.shape[0]
-
-        # 1. Apply linear projections
-        Q = self.W_q(query)  # (batch, seq_len, d_model)
-        K = self.W_k(key)
-        V = self.W_v(value)
-
-        # 2. Reshape for multi-head: (batch, seq_len, d_model)
-        #    → (batch, seq_len, num_heads, d_k)
-        #    → (batch, num_heads, seq_len, d_k)
-        Q = Q.view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        K = K.view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        V = V.view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-
-        # 3. Apply attention for each head
-        attended_values, attention_weights = self.attention(Q, K, V, mask)
-        # attended_values: (batch, num_heads, seq_len, d_k)
-        # attention_weights: (batch, num_heads, seq_len, seq_len)
-
-        # 4. Concatenate heads: (batch, num_heads, seq_len, d_k)
-        #    → (batch, seq_len, num_heads, d_k)
-        #    → (batch, seq_len, d_model)
-        output = attended_values.transpose(1, 2).contiguous()
-        output = output.view(batch_size, -1, self.d_model)
-
-        # 5. Final linear projection
-        output = self.W_o(output)
-
-        return output, attention_weights
+        self.d_k = d_k
+        self.d_v = d_v
+        self.d_m = d_m
+        self.heads = nn.ModuleList([ManualScaledDotProductAttention(d_k, d_v, d_m) for _ in range(h)])
+        self.W_o = nn.Linear(h*self.d_v, self.d_m)
+        
+    def forward(self,X: torch.Tensor, mask: None):
+        # creating a concatenated Z from all the h attention heads
+        Zs = [head(X, mask)[0] for head in self.heads]
+        Z = torch.cat(Zs, dim=-1)
+        # creating the downprojected matrix
+        Z_d = self.W_o(Z)
+        return Z_d
 
 
 # ============================================================================
@@ -178,38 +138,7 @@ class PositionalEncoding(nn.Module):
 
     def __init__(self, d_model: int = 512, max_seq_len: int = 5000, dropout: float = 0.1):
         super().__init__()
-        self.dropout = nn.Dropout(dropout)
-
-        # Create position encoding matrix
-        pe = torch.zeros(max_seq_len, d_model)
-        position = torch.arange(0, max_seq_len, dtype=torch.float).unsqueeze(1)
-
-        # Compute dimension exponents
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2, dtype=torch.float) *
-            -(math.log(10000.0) / d_model)
-        )
-
-        # Apply sin to even indices, cos to odd indices
-        pe[:, 0::2] = torch.sin(position * div_term)
-        if d_model % 2 == 1:
-            pe[:, 1::2] = torch.cos(position * div_term[:-1])
-        else:
-            pe[:, 1::2] = torch.cos(position * div_term)
-
-        # Register as buffer (not a parameter, but part of model state)
-        self.register_buffer('pe', pe.unsqueeze(0))  # (1, max_seq_len, d_model)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (batch, seq_len, d_model)
-
-        Returns:
-            x + positional encoding: (batch, seq_len, d_model)
-        """
-        seq_len = x.shape[1]
-        return self.dropout(x + self.pe[:, :seq_len, :])
+        
 
 
 # ============================================================================

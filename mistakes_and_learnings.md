@@ -350,6 +350,230 @@ attention_wts = torch.where(torch.isnan(attention_wts), torch.zeros_like(attenti
 
 ---
 
+### Multi-Head Attention: Building It (Loop Version)
+
+**Q: "Each head has its own W_q, W_k, W_v. How do I create h of them?"**
+
+**A:** Create h instances of the single-head class, wrapped in `nn.ModuleList`:
+```python
+self.heads = nn.ModuleList([ManualScaledDotProductAttention(d_k, d_v, d_m) for _ in range(h)])
+```
+- ❌ **Trap:** a plain Python list `[...]` does NOT register the heads' weights. They won't appear in `model.parameters()`, the optimizer never updates them, and `.to(device)` doesn't move them. There is no error message; the model just silently doesn't learn.
+
+---
+
+**Q: "Do we need to initialize each head with a different seed?"**
+
+**A:** No. Every `nn.Linear` draws from the same global random number generator, which keeps advancing, so each head gets different weights automatically.
+- `torch.manual_seed(...)` is for **reproducibility**. Set it once at the top of the script.
+- Resetting the *same* seed before each head would make all heads identical, which defeats the purpose of having multiple heads.
+
+---
+
+**Q: "How do I loop over the heads and keep only Z?"**
+
+**A:** Each head returns a tuple `(Z, attention_wts)`. Call the head, then index into the result:
+```python
+Zs = [head(X, mask)[0] for head in self.heads]
+# or unpack: Z, _ = head(X, mask)   (_ = "I don't need this")
+```
+
+---
+
+**Q: "How do I pass a function or class name as a parameter?"**
+
+**A:** In Python, functions and classes are objects like any other value. Pass the name **without parentheses**:
+```python
+def __init__(self, ..., attention_cls=ManualScaledDotProductAttention):
+    self.heads = nn.ModuleList([attention_cls(d_k, d_v, d_m) for _ in range(h)])
+```
+`attention_cls` is the class itself; `attention_cls(...)` creates an instance. This will be useful for swapping in GQA later.
+
+---
+
+**Q: "Is there an equivalent of R's cbind?"**
+
+**A:**
+```python
+torch.cat(Zs, dim=-1)    # cbind → (n, h*d_v)
+torch.cat(Zs, dim=0)     # rbind
+torch.stack(Zs, dim=0)   # creates a NEW dimension → (h, n, d_v)
+```
+
+---
+
+**Q: "What are the inputs to multi-head attention?"**
+
+**A:** The constructor takes `h, d_m, d_k, d_v`, and `mask` goes in `forward`. The usual convention is **`d_k = d_v = d_m // h`**:
+- h small heads cost about the same as one full-size head.
+- The concatenated output is exactly `d_m` wide.
+- Add `assert d_m % h == 0`.
+
+**Missed step:** after concatenating, apply the **output projection `W_o = nn.Linear(h*d_v, d_m)`**. It mixes information across heads and restores width `d_m`, which the residual `x + attn_out` needs.
+
+---
+
+### Mistakes in My First Draft of MHA
+
+My first draft stored `X` in `__init__`, passed `X` into each head's constructor, and used `head[0]` to get Z.
+
+- ❌ **Data in `__init__`:** `__init__` builds the model once, from settings. `forward` runs on every new input. Storing `self.X` would tie the model to a single input forever.
+- ❌ **Arguments shifted by position:** `ManualScaledDotProductAttention(X, d_k, d_v, d_m)` passes 4 values to a constructor that takes 3, so `X` landed in `d_k`, and so on.
+- ❌ **`head[0]`** indexes the module object itself, which raises "not subscriptable". You have to *call* it first: `head(X, mask)[0]`.
+
+---
+
+### Build Time vs Run Time
+
+**Q: "If X isn't in `__init__`, how do the heads get created? Don't they need X?"**
+
+**A:** Building a module and running it are two separate steps.
+```python
+head = ManualScaledDotProductAttention(8, 8, 64)  # BUILD: sizes only → runs __init__
+Z, wts = head(X)                                   # RUN: data goes in → runs forward
+Z2, _ = head(X_other)                              # same weights, new data
+```
+`nn.Linear(d_m, d_k)` only needs the two sizes to allocate a random `d_m × d_k` matrix; no data is involved. It's the same as R's `f <- function(x)` (define) versus `f(data)` (call).
+
+---
+
+**Q: "What kind of object is `head` in `self.heads`?"**
+
+**A:** It's an **instance** of `ManualScaledDotProductAttention`, a self-contained object holding its own `W_q`, `W_k` and `W_v`.
+```python
+type(mha.heads[0])    # ManualScaledDotProductAttention
+mha.heads[0].W_q      # Linear(in_features=64, out_features=8, bias=True)
+```
+`head(X)` works because `nn.Module` defines `__call__`, which runs `forward(X)` plus some PyTorch bookkeeping. Always call `head(X)`, never `head.forward(X)`.
+
+---
+
+**Q: "Isn't W_o initialized inside forward?"**
+
+**A:** No, it goes in `__init__`. If `W_o` were created inside `forward`:
+1. It would get **new random weights on every call**, so it could never learn.
+2. **The optimizer can't see it.** `Adam(model.parameters())` collects the parameter list once, at setup.
+3. **It isn't saved** by `state_dict()`.
+
+**Rule:** anything with learnable weights (`nn.Linear`, `nn.LayerNorm`, `nn.Embedding`) is created in `__init__` and stored on `self`. `forward` only *uses* those layers. Operations with no weights (`torch.cat`, `F.softmax`, `@`) live in `forward`.
+
+---
+
+### Mistakes in My Second Draft of MHA
+
+- ❌ `forward(self, X)` used `mask` without having it as a parameter, which raises `NameError`. Fix: `forward(self, X, mask=None)`.
+- ❌ `Z @ self.W_o`: `W_o` is an `nn.Linear` **module**, not a matrix, so `@` fails. Call it instead: `self.W_o(Z)`.
+  - Internally, `nn.Linear` stores `.weight` with shape `(out, in)` and computes `Z @ weight.T + bias`. This is also why you never do the `@` yourself with a Linear layer.
+
+---
+
+### Decision: Stay 2D (No Batch Dimension) for Now
+
+**Decision:** Keep inputs as `(n, d_m)` while learning, and add batching later.
+- `Q @ K.T` is correct for 2D tensors.
+- ⚠️ **When batching is added:** on a 3D tensor `(batch, n, d_k)`, `.T` reverses *all* dimensions. Switch to `K.transpose(-2, -1)`, which swaps only the last two.
+- The existing test functions (`test_attention`, `test_multi_head_attention`, etc.) use 3D inputs, so test with 2D inputs such as `torch.randn(10, 64)` for now.
+
+---
+
+## Phase 3: Positional & Rotary Embeddings (🚧 In Progress)
+
+### Why Attention Needs Position Information
+- Nothing in `softmax(Q @ K.T / √d_k) @ V` depends on a token's **index**. If you shuffle the rows of X, the rows of Z shuffle in exactly the same way, and nothing else changes (attention is *permutation-equivariant*).
+- So "dog bites man" and "man bites dog" look the same to attention, apart from the order of the rows.
+- Position therefore has to be injected explicitly.
+
+### Two Approaches
+| | Sinusoidal (2017) | RoPE (2021, Llama etc.) |
+|---|---|---|
+| What it does | **Adds** a fixed vector to each token's embedding | **Rotates** q and k vectors by an angle that depends on position |
+| Where | Once, on X, before the first layer | Inside every attention head, after W_q/W_k, before Q @ K.T |
+| Touches V? | Yes (it's part of X) | No, only Q and K |
+| Position type | Absolute (relative only indirectly) | The score q_m · k_n depends only on **m − n** (relative) |
+
+**Shared idea:** both split the dimensions into pairs (2i, 2i+1) and give each pair its own frequency θ_i = 1 / 10000^(2i/d).
+- Low i → fast-spinning pair (fine-grained position, like a clock's second hand)
+- High i → slow-spinning pair (coarse position, like an hour hand)
+
+---
+
+### Sinusoidal PE: Shapes and Ranges
+
+**Q: "X is n × d_m. Is PE the same size?"**
+
+**A:** Yes. It's added element-wise (`X + PE`), so it must match. Row `pos` of PE is the "position fingerprint" for the token at that position, and it is the same no matter which token sits there.
+
+---
+
+**Q: "Which of n and d_m set the ranges of pos and i?"**
+
+**A:**
+- **pos** indexes rows: `0 … n-1`, so **n** sets its range.
+- **i** indexes column *pairs*: `0 … d_m/2 - 1`, so **d_m** sets its range. Column `2i` gets sin and column `2i+1` gets cos, at the same frequency.
+- The exponent `2i/d_m` runs from 0 to about 1, so wavelengths range from 2π (fastest pair) to about 10000·2π (slowest pair).
+- d_m must be even: add `assert d_m % 2 == 0`.
+
+---
+
+**Q: "What is the role of max_seq_len?"**
+
+**A:** PE depends only on *position*, never on the data. So we compute the table **once in `__init__`** (build time), sized for the longest sequence we'll ever see: `(max_seq_len, d_m)`. Each `forward` call then **slices the first n rows** (run time): `X + pe[:n]`.
+- This is the same build-vs-run split as with W_o.
+- It also caps the model: sequences longer than max_seq_len won't fit.
+
+---
+
+### New Concept: `register_buffer`
+
+Three ways to store a tensor on a module:
+
+| | Learned (gets gradients)? | Moves with `.to(device)` / saved in `state_dict`? |
+|---|---|---|
+| `nn.Parameter` / `nn.Linear` | ✅ | ✅ |
+| `self.register_buffer('pe', pe)` | ❌ | ✅ |
+| `self.pe = pe` (plain attribute) | ❌ | ❌ (stays on CPU; you get a device-mismatch error on GPU) |
+
+PE is fixed (not learned) but must travel with the model, so **buffer** is the right choice.
+
+---
+
+### RoPE vs Sinusoidal: Implementation Differences
+
+**Q: "How would RoPE's implementation differ?"**
+
+**A:** The precomputed table is almost the same. What differs is **where** it's applied and **how**.
+
+| | Sinusoidal | RoPE |
+|---|---|---|
+| Table | `pos · θ_i`, shape `(max_seq_len, d_m/2)` | Same angle grid, but over **d_k** (head dim): `(max_seq_len, d_k/2)` |
+| Store | one `pe` buffer | `cos` and `sin` buffers |
+| Applied to | X, once, before the first layer | **Q and K** inside every head, after W_q/W_k, before `Q @ K.T` |
+| Operation | add: `X + pe[:n]` | rotate each pair `(x_2i, x_2i+1)` at position m by angle `m·θ_i` |
+| V | gets position info (via X) | untouched |
+
+**The rotation (2D rotation applied to each pair):**
+```
+x'_2i   = x_2i · cos(mθ_i) − x_2i+1 · sin(mθ_i)
+x'_2i+1 = x_2i · sin(mθ_i) + x_2i+1 · cos(mθ_i)
+```
+
+**Why it gives relative position:** rotating q by angle m and k by angle n gives
+`(R_m q) · (R_n k) = q · R_(n−m) k`, so the score depends only on the **offset n − m**.
+- Rotations preserve vector length, so only the *angle* between q and k changes, never their magnitude.
+
+**Where it plugs in:**
+```python
+Q = self.W_q(X); K = self.W_k(X)
+Q, K = rope(Q), rope(K)          # ← new step
+scores = Q @ K.T / sqrt(d_k)
+```
+
+**Implementation note:** pairs can be *interleaved* `(0,1), (2,3), …` (the original paper) or *split in halves* `(i, i + d/2)` (the Hugging Face Llama `rotate_half`). Both work as long as you're consistent, but you can't load pretrained weights that use the other layout.
+
+**Test:** `rope(q)` at position m dotted with `rope(k)` at position n should equal the same at positions m+5 and n+5. Also, `‖rope(q)‖ == ‖q‖`.
+
+---
+
 ## General Insights
 
 ### Why This Matters
@@ -384,5 +608,5 @@ When something doesn't work:
 
 ---
 
-*Last updated: 2026-11-13*
-*Current focus: Implementing attention mechanisms*
+*Last updated: 2026-11-14*
+*Current focus: Multi-Head Attention (loop version → vectorized version)*
